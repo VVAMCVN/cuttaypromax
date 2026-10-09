@@ -1,0 +1,1156 @@
+// ==UserScript==
+// @name         IconCaptcha Solver
+// @namespace    outcome.captcha
+// @version      4.7
+// @description  Auto-verify + auto-continue + busy flag + live scan
+// @author       outcome
+// @match        https://pub.cryptolinkforearn.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    var SCRIPT_VERSION = '4.7';
+
+    var DEFAULTS = {
+        ACTION_DELAY_MS: 1000,
+        SCAN_MS: 200,
+        MIN_SCORE: 0.55,
+        MIN_MARGIN: 0.05,
+        HUE_STRONG: 0.85,
+        HUE_BOOST: 0.22,
+        HUE_TOLERANCE: 45,
+        GRID: 56,
+        DOWNSCALE: 1,
+        CHROMA_MIN: 16,
+        BG_DIST_MIN: 65,
+        ANGLE_STEP: 12,
+        FINE_STEP: 2,
+        FINE_RANGE: 8,
+        MICRO_ENABLED: false,
+        MICRO_STEP: 1,
+        MICRO_RANGE: 3,
+        RADIAL_BINS: 36,
+        WEIGHT_OVERLAP: 0.22,
+        WEIGHT_RADIAL: 0.20,
+        WEIGHT_HU: 0.20,
+        WEIGHT_HOLE: 0.10,
+        WEIGHT_SOLIDITY: 0.06,
+        WEIGHT_ASPECT: 0.05,
+        WEIGHT_COLOR: 0.17,
+        HU_DIST_SCALE: 2.5,
+        BLUR_ENABLED: true,
+        CACHE_SIGS: true,
+        BLOB_TRIM_THR: 0.75,
+        HOLE_MIN_SIZE: 5,
+        VERIFY_BUTTON_ENABLED: true,
+        VERIFY_INITIAL_DELAY_MS: 1500,
+        VERIFY_COOLDOWN_MS: 3000,
+        CONTINUE_BUTTON_ENABLED: true,
+        CONTINUE_COOLDOWN_MS: 2000,
+        CONTINUE_REQUIRE_SUCCESS_MSG: true,
+        GLOBAL_REFRESH_LIMIT: 6,
+        GLOBAL_COOLDOWN_MS: 8000,
+        PAGE_RELOAD_DELAY: 800,
+        PAGE_RELOAD_COOLDOWN: 15000,
+        RETURN_MODE: 'back',
+        RETURN_URL: '',
+        SHOW_DEBUG: true,
+        VERBOSE: true
+    };
+
+    function gmGet(k, d) { try { var v = GM_getValue(k, undefined); return (v === undefined || v === null) ? d : v; } catch (e) { return d; } }
+    function gmSet(k, v) { try { GM_setValue(k, v); } catch (e) {} }
+    var storedVersion = gmGet('cfg_script_version', '');
+    if (storedVersion !== SCRIPT_VERSION) {
+        for (var dk in DEFAULTS) gmSet('cfg_' + dk, DEFAULTS[dk]);
+        gmSet('cfg_script_version', SCRIPT_VERSION);
+    }
+    var CFG = {};
+    for (var k in DEFAULTS) CFG[k] = gmGet('cfg_' + k, DEFAULTS[k]);
+    CFG.PAGE_RELOAD_MSG = /Vui lòng tải lại trang|Please refresh the page/i;
+    CFG.VERIFY_TEXT = /Xác minh để tiếp tục|Verify to continue|Verify to proceed/i;
+    CFG.SUCCESS_MSG = /ready|correct|thành công|đúng|passed|success/i;
+
+    var SCRIPT_LOAD_TIME = Date.now();
+
+    function saveConfig() {
+        for (var kk in DEFAULTS) if (typeof CFG[kk] !== 'object') gmSet('cfg_' + kk, CFG[kk]);
+        gmSet('cfg_script_version', SCRIPT_VERSION);
+    }
+    function resetConfig() {
+        for (var kk in DEFAULTS) { CFG[kk] = DEFAULTS[kk]; gmSet('cfg_' + kk, DEFAULTS[kk]); }
+    }
+
+    function log() { if (CFG.VERBOSE) try { console.log.apply(console, ['%c[solver]', 'color:#0ff;font-weight:bold'].concat([].slice.call(arguments))); } catch (e) {} }
+    function warn() { try { console.warn.apply(console, ['%c[solver]', 'color:#ff0;font-weight:bold'].concat([].slice.call(arguments))); } catch (e) {} }
+    function err() { try { console.error.apply(console, ['%c[solver]', 'color:#f55;font-weight:bold'].concat([].slice.call(arguments))); } catch (e) {} }
+    function mk(w, h) { var c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+    function count(m) { var n = 0; for (var i = 0; i < m.length; i++) n += m[i]; return n; }
+
+    function rgb2hue(r, g, b) {
+        r /= 255; g /= 255; b /= 255;
+        var mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+        var d = mx - mn;
+        if (d === 0) return -1;
+        var h;
+        if (mx === r) h = ((g - b) / d) % 6;
+        else if (mx === g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+        h *= 60;
+        if (h < 0) h += 360;
+        return h;
+    }
+    function hueMatch(h1, h2) {
+        if (h1 < 0 || h2 < 0) return 0;
+        var d = Math.abs(h1 - h2); d = Math.min(d, 360 - d);
+        if (d <= CFG.HUE_TOLERANCE) return 1;
+        if (d >= 180) return 0;
+        return 1 - (d - CFG.HUE_TOLERANCE) / (180 - CFG.HUE_TOLERANCE);
+    }
+    function parseFill(fill) {
+        if (!fill) return null;
+        fill = String(fill).trim().toLowerCase();
+        var m = fill.match(/^#([0-9a-f]{6})$/);
+        if (m) { var v = parseInt(m[1], 16); return { r: (v >> 16) & 255, g: (v >> 8) & 255, b: v & 255 }; }
+        m = fill.match(/^#([0-9a-f]{3})$/);
+        if (m) { var s = m[1]; return { r: parseInt(s[0]+s[0],16), g: parseInt(s[1]+s[1],16), b: parseInt(s[2]+s[2],16) }; }
+        m = fill.match(/rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+        if (m) return { r: +m[1], g: +m[2], b: +m[3] };
+        return null;
+    }
+
+    function medianFilter3(m, W, H) {
+        var o = new Uint8Array(W * H);
+        for (var y = 1; y < H - 1; y++) for (var x = 1; x < W - 1; x++) {
+            var s = 0;
+            for (var dy = -1; dy <= 1; dy++) for (var dx = -1; dx <= 1; dx++) s += m[(y + dy) * W + (x + dx)];
+            o[y * W + x] = s >= 4 ? 1 : 0;
+        }
+        return o;
+    }
+    function erode1(m, W, H) {
+        var o = new Uint8Array(W * H);
+        for (var y = 1; y < H - 1; y++) for (var x = 1; x < W - 1; x++) {
+            var i = y * W + x;
+            if (m[i] && m[i - 1] && m[i + 1] && m[i - W] && m[i + W]) o[i] = 1;
+        }
+        return o;
+    }
+    function keepLargest(m, W, H) {
+        var L = new Int32Array(W * H), S = new Int32Array(W * H), comps = [], next = 1;
+        for (var s = 0; s < W * H; s++) {
+            if (!m[s] || L[s]) continue;
+            var sp = 0; S[sp++] = s; L[s] = next; var size = 0;
+            while (sp > 0) {
+                var idx = S[--sp]; size++;
+                var x = idx % W, y = (idx / W) | 0;
+                if (x > 0)     { var a = idx - 1; if (m[a] && !L[a]) { L[a] = next; S[sp++] = a; } }
+                if (x < W - 1) { var b = idx + 1; if (m[b] && !L[b]) { L[b] = next; S[sp++] = b; } }
+                if (y > 0)     { var c = idx - W; if (m[c] && !L[c]) { L[c] = next; S[sp++] = c; } }
+                if (y < H - 1) { var d = idx + W; if (m[d] && !L[d]) { L[d] = next; S[sp++] = d; } }
+            }
+            comps.push({ id: next, size: size }); next++;
+        }
+        if (!comps.length) return m;
+        comps.sort(function (a, b) { return b.size - a.size; });
+        var maxS = comps[0].size, keep = {};
+        for (var i = 0; i < comps.length; i++) if (comps[i].size >= maxS * 0.25) keep[comps[i].id] = 1;
+        var o = new Uint8Array(W * H);
+        for (var j = 0; j < W * H; j++) if (m[j] && keep[L[j]]) o[j] = 1;
+        return o;
+    }
+    function bbox(m, W, H) {
+        var a = W, b = H, c = -1, d = -1;
+        for (var i = 0; i < W * H; i++) if (m[i]) {
+            var x = i % W, y = (i / W) | 0;
+            if (x < a) a = x; if (y < b) b = y; if (x > c) c = x; if (y > d) d = y;
+        }
+        return { minX: a, minY: b, maxX: c, maxY: d, ok: c >= 0 };
+    }
+    function fitGrid(src, srcW, minX, minY, maxX, maxY) {
+        var bw = maxX - minX + 1, bh = maxY - minY + 1;
+        var G = CFG.GRID;
+        var o = new Float32Array(G * G);
+        var sc = Math.min(G / bw, G / bh);
+        var dw = Math.round(bw * sc), dh = Math.round(bh * sc);
+        var ox = Math.floor((G - dw) / 2), oy = Math.floor((G - dh) / 2);
+        for (var y = 0; y < dh; y++) for (var x = 0; x < dw; x++) {
+            var sx = minX + Math.floor(x / sc), sy = minY + Math.floor(y / sc);
+            o[(oy + y) * G + (ox + x)] = src[sy * srcW + sx] ? 1 : 0;
+        }
+        return o;
+    }
+    function alignByCOM(sig, G) {
+        var sx = 0, sy = 0, n = 0;
+        for (var y = 0; y < G; y++) for (var x = 0; x < G; x++) if (sig[y * G + x] > 0.5) { sx += x; sy += y; n++; }
+        if (!n) return sig;
+        var dx = Math.round((G - 1) / 2 - sx / n);
+        var dy = Math.round((G - 1) / 2 - sy / n);
+        if (dx === 0 && dy === 0) return sig;
+        var o = new Float32Array(G * G);
+        for (var yy = 0; yy < G; yy++) for (var xx = 0; xx < G; xx++) {
+            if (sig[yy * G + xx] <= 0.5) continue;
+            var nx = xx + dx, ny = yy + dy;
+            if (nx < 0 || ny < 0 || nx >= G || ny >= G) continue;
+            o[ny * G + nx] = 1;
+        }
+        return o;
+    }
+    function gridAspect(sig, G) {
+        var minX = G, minY = G, maxX = -1, maxY = -1;
+        for (var y = 0; y < G; y++) for (var x = 0; x < G; x++) if (sig[y * G + x] > 0.5) {
+            if (x < minX) minX = x; if (y < minY) minY = y; if (x > maxX) maxX = x; if (y > maxY) maxY = y;
+        }
+        if (maxX < 0) return 1;
+        return (maxX - minX + 1) / (maxY - minY + 1);
+    }
+    function blurGrid(sig, G) {
+        var o = new Float32Array(G * G);
+        for (var y = 0; y < G; y++) for (var x = 0; x < G; x++) {
+            var s = 0, n = 0;
+            for (var dy = -1; dy <= 1; dy++) for (var dx = -1; dx <= 1; dx++) {
+                var nx = x + dx, ny = y + dy;
+                if (nx < 0 || ny < 0 || nx >= G || ny >= G) continue;
+                s += sig[ny * G + nx]; n++;
+            }
+            o[y * G + x] = s / n;
+        }
+        return o;
+    }
+    function rotateGrid(sig, angDeg) {
+        var r = angDeg * Math.PI / 180, cos = Math.cos(r), sin = Math.sin(r);
+        var G = CFG.GRID, cx = (G - 1) / 2, cy = (G - 1) / 2;
+        var o = new Float32Array(G * G);
+        for (var y = 0; y < G; y++) for (var x = 0; x < G; x++) {
+            var dx = x - cx, dy = y - cy;
+            var sx = cx + dx * cos - dy * sin;
+            var sy = cy + dx * sin + dy * cos;
+            if (sx < -1 || sy < -1 || sx > G || sy > G) continue;
+            var x0 = Math.floor(sx), y0 = Math.floor(sy);
+            var fx = sx - x0, fy = sy - y0;
+            var v = 0, w = 0;
+            for (var i = 0; i <= 1; i++) for (var j = 0; j <= 1; j++) {
+                var xi = x0 + i, yj = y0 + j;
+                if (xi < 0 || yj < 0 || xi >= G || yj >= G) continue;
+                var wi = (i ? fx : 1 - fx) * (j ? fy : 1 - fy);
+                v += sig[yj * G + xi] * wi; w += wi;
+            }
+            o[y * G + x] = w > 0 ? v / w : 0;
+        }
+        return o;
+    }
+    function scoreMasks(a, b) {
+        var inter = 0, uni = 0, aN = 0, bN = 0;
+        for (var i = 0; i < a.length; i++) {
+            var x = a[i] > 0.5 ? 1 : 0, y = b[i] > 0.5 ? 1 : 0;
+            if (x) aN++; if (y) bN++;
+            if (x || y) { uni++; if (x && y) inter++; }
+        }
+        if (uni === 0) return { iou: 0, cov: 0 };
+        var minN = Math.min(aN, bN);
+        return { iou: inter / uni, cov: minN ? inter / minN : 0 };
+    }
+    function softOverlap(a, b) {
+        var sum = 0;
+        for (var i = 0; i < a.length; i++) sum += 1 - Math.abs(a[i] - b[i]);
+        return a.length ? sum / a.length : 0;
+    }
+
+    function radialProfile(sig, G, bins) {
+        var sx = 0, sy = 0, n = 0;
+        for (var y = 0; y < G; y++) for (var x = 0; x < G; x++) if (sig[y * G + x] > 0.5) { sx += x; sy += y; n++; }
+        var prof = new Float32Array(bins);
+        if (!n) return prof;
+        var cx = sx / n, cy = sy / n;
+        for (var yy = 0; yy < G; yy++) for (var xx = 0; xx < G; xx++) {
+            if (sig[yy * G + xx] <= 0.5) continue;
+            var dx = xx - cx, dy = yy - cy;
+            var r = Math.sqrt(dx * dx + dy * dy);
+            var a = Math.atan2(dy, dx);
+            if (a < 0) a += Math.PI * 2;
+            var b = Math.floor(a / (Math.PI * 2) * bins) % bins;
+            if (r > prof[b]) prof[b] = r;
+        }
+        var mx = 0;
+        for (var i = 0; i < bins; i++) if (prof[i] > mx) mx = prof[i];
+        if (mx > 0) for (var j = 0; j < bins; j++) prof[j] /= mx;
+        var sm = new Float32Array(bins);
+        for (var kk = 0; kk < bins; kk++) sm[kk] = (prof[(kk - 1 + bins) % bins] + prof[kk] + prof[(kk + 1) % bins]) / 3;
+        return sm;
+    }
+    function radialSim(a, b) {
+        if (!a || !b) return 0;
+        var s = 0;
+        for (var i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+        return Math.max(0, 1 - s / a.length);
+    }
+
+    function huMoments(sig, G) {
+        var m00 = 0, m10 = 0, m01 = 0;
+        for (var y = 0; y < G; y++) for (var x = 0; x < G; x++) if (sig[y * G + x] > 0.5) { m00++; m10 += x; m01 += y; }
+        if (m00 < 20) return null;
+        var cx = m10 / m00, cy = m01 / m00;
+        var mu20 = 0, mu02 = 0, mu11 = 0, mu30 = 0, mu03 = 0, mu21 = 0, mu12 = 0;
+        for (var y2 = 0; y2 < G; y2++) for (var x2 = 0; x2 < G; x2++) {
+            if (sig[y2 * G + x2] <= 0.5) continue;
+            var dx = x2 - cx, dy = y2 - cy;
+            mu20 += dx * dx; mu02 += dy * dy; mu11 += dx * dy;
+            mu30 += dx * dx * dx; mu03 += dy * dy * dy;
+            mu21 += dx * dx * dy; mu12 += dx * dy * dy;
+        }
+        var s = m00;
+        function nrm(mu, p, q) { return mu / Math.pow(s, 1 + (p + q) / 2); }
+        var n20 = nrm(mu20, 2, 0), n02 = nrm(mu02, 0, 2), n11 = nrm(mu11, 1, 1);
+        var n30 = nrm(mu30, 3, 0), n03 = nrm(mu03, 0, 3);
+        var n21 = nrm(mu21, 2, 1), n12 = nrm(mu12, 1, 2);
+        var h1 = n20 + n02;
+        var h2 = (n20 - n02) * (n20 - n02) + 4 * n11 * n11;
+        var h3 = (n30 - 3 * n12) * (n30 - 3 * n12) + (3 * n21 - n03) * (3 * n21 - n03);
+        var h4 = (n30 + n12) * (n30 + n12) + (n21 + n03) * (n21 + n03);
+        var h5 = (n30 - 3 * n12) * (n30 + n12) * ((n30 + n12) * (n30 + n12) - 3 * (n21 + n03) * (n21 + n03))
+               + (3 * n21 - n03) * (n21 + n03) * (3 * (n30 + n12) * (n30 + n12) - (n21 + n03) * (n21 + n03));
+        var h6 = (n20 - n02) * ((n30 + n12) * (n30 + n12) - (n21 + n03) * (n21 + n03))
+               + 4 * n11 * (n30 + n12) * (n21 + n03);
+        var h7 = (3 * n21 - n03) * (n30 + n12) * ((n30 + n12) * (n30 + n12) - 3 * (n21 + n03) * (n21 + n03))
+               - (n30 - 3 * n12) * (n21 + n03) * (3 * (n30 + n12) * (n30 + n12) - (n21 + n03) * (n21 + n03));
+        return [h1, h2, h3, h4, h5, h6, h7];
+    }
+    function huSimilarity(h1, h2) {
+        if (!h1 || !h2) return 0.5;
+        var sum = 0;
+        for (var i = 0; i < 7; i++) {
+            var a = Math.sign(h1[i]) * Math.log10(Math.abs(h1[i]) + 1e-3);
+            var b = Math.sign(h2[i]) * Math.log10(Math.abs(h2[i]) + 1e-3);
+            sum += Math.abs(a - b);
+        }
+        return Math.max(0, 1 - (sum / 7) / CFG.HU_DIST_SCALE);
+    }
+
+    function countHoles(sig, G) {
+        var visited = new Uint8Array(G * G);
+        var queue = [];
+        for (var x = 0; x < G; x++) {
+            if (sig[x] <= 0.5) queue.push(x);
+            if (sig[(G - 1) * G + x] <= 0.5) queue.push((G - 1) * G + x);
+        }
+        for (var y = 0; y < G; y++) {
+            if (sig[y * G] <= 0.5) queue.push(y * G);
+            if (sig[y * G + G - 1] <= 0.5) queue.push(y * G + G - 1);
+        }
+        var head = 0;
+        while (head < queue.length) {
+            var idx = queue[head++];
+            if (visited[idx]) continue;
+            visited[idx] = 1;
+            var px = idx % G, py = (idx / G) | 0;
+            if (px > 0     && !visited[idx - 1] && sig[idx - 1] <= 0.5) queue.push(idx - 1);
+            if (px < G - 1 && !visited[idx + 1] && sig[idx + 1] <= 0.5) queue.push(idx + 1);
+            if (py > 0     && !visited[idx - G] && sig[idx - G] <= 0.5) queue.push(idx - G);
+            if (py < G - 1 && !visited[idx + G] && sig[idx + G] <= 0.5) queue.push(idx + G);
+        }
+        var holes = 0;
+        var minSize = CFG.HOLE_MIN_SIZE;
+        for (var i = 0; i < G * G; i++) {
+            if (sig[i] <= 0.5 && !visited[i]) {
+                var q2 = [i];
+                var size = 0;
+                var h2 = 0;
+                while (h2 < q2.length) {
+                    var ii = q2[h2++];
+                    if (visited[ii]) continue;
+                    visited[ii] = 1; size++;
+                    var px2 = ii % G, py2 = (ii / G) | 0;
+                    if (px2 > 0     && !visited[ii - 1] && sig[ii - 1] <= 0.5) q2.push(ii - 1);
+                    if (px2 < G - 1 && !visited[ii + 1] && sig[ii + 1] <= 0.5) q2.push(ii + 1);
+                    if (py2 > 0     && !visited[ii - G] && sig[ii - G] <= 0.5) q2.push(ii - G);
+                    if (py2 < G - 1 && !visited[ii + G] && sig[ii + G] <= 0.5) q2.push(ii + G);
+                }
+                if (size >= minSize) holes++;
+            }
+        }
+        return holes;
+    }
+    function holeMatch(h1, h2) {
+        var d = Math.abs(h1 - h2);
+        if (d === 0) return 1;
+        if (d === 1) return 0.6;
+        if (d === 2) return 0.25;
+        return 0;
+    }
+
+    function cross(o, a, b) { return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]); }
+    function convexHullArea(points) {
+        if (points.length < 3) return 0;
+        points.sort(function (a, b) { return a[0] !== b[0] ? a[0] - b[0] : a[1] - b[1]; });
+        var lower = [], upper = [], i;
+        for (i = 0; i < points.length; i++) {
+            while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], points[i]) <= 0) lower.pop();
+            lower.push(points[i]);
+        }
+        for (i = points.length - 1; i >= 0; i--) {
+            while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], points[i]) <= 0) upper.pop();
+            upper.push(points[i]);
+        }
+        lower.pop(); upper.pop();
+        var hull = lower.concat(upper);
+        var area = 0;
+        for (var k = 0; k < hull.length; k++) {
+            var kk = (k + 1) % hull.length;
+            area += hull[k][0] * hull[kk][1] - hull[kk][0] * hull[k][1];
+        }
+        return Math.abs(area) / 2;
+    }
+    function solidity(sig, G) {
+        var pts = [];
+        for (var y = 0; y < G; y++) for (var x = 0; x < G; x++) if (sig[y * G + x] > 0.5) pts.push([x, y]);
+        if (pts.length === 0) return 0;
+        var hullArea = convexHullArea(pts);
+        if (hullArea <= 0) return 1;
+        return pts.length / hullArea;
+    }
+    function soliditySim(s1, s2) { return Math.max(0, 1 - Math.abs(s1 - s2) / 0.35); }
+
+    function modeBg(data, W, H) {
+        var hist = {};
+        for (var i = 0; i < W * H; i++) {
+            var o = i * 4;
+            var key = ((data[o] >> 3) << 10) | ((data[o + 1] >> 3) << 5) | ((data[o + 2] >> 3));
+            hist[key] = (hist[key] || 0) + 1;
+        }
+        var bg = 0, bc = -1;
+        for (var k in hist) if (hist[k] > bc) { bc = hist[k]; bg = k | 0; }
+        return { r: ((bg >> 10) & 31) << 3, g: ((bg >> 5) & 31) << 3, b: (bg & 31) << 3 };
+    }
+    function chromaMask(data, W, H, thr) {
+        var m = new Uint8Array(W * H);
+        for (var i = 0; i < W * H; i++) {
+            var o = i * 4;
+            var mx = Math.max(data[o], data[o + 1], data[o + 2]);
+            var mn = Math.min(data[o], data[o + 1], data[o + 2]);
+            if (mx - mn > thr) m[i] = 1;
+        }
+        return m;
+    }
+    function bgDistMask(data, W, H, bg, thr) {
+        var m = new Uint8Array(W * H);
+        for (var i = 0; i < W * H; i++) {
+            var o = i * 4;
+            var d = Math.abs(data[o] - bg.r) + Math.abs(data[o + 1] - bg.g) + Math.abs(data[o + 2] - bg.b);
+            if (d > thr) m[i] = 1;
+        }
+        return m;
+    }
+    function cleanPipeline(raw, W, H, minPx) {
+        var med = medianFilter3(raw, W, H);
+        var mBig = keepLargest(med, W, H);
+        var n = count(mBig);
+        if (n < minPx) return null;
+        var bb = bbox(mBig, W, H);
+        if (!bb.ok) return null;
+        var fill = n / ((bb.maxX - bb.minX + 1) * (bb.maxY - bb.minY + 1));
+        if (fill > CFG.BLOB_TRIM_THR) {
+            var mTrim = erode1(mBig, W, H);
+            var nT = count(mTrim);
+            if (nT >= minPx) {
+                var bbT = bbox(mTrim, W, H);
+                if (bbT.ok) {
+                    mBig = mTrim; bb = bbT; n = nT;
+                    fill = n / ((bb.maxX - bb.minX + 1) * (bb.maxY - bb.minY + 1));
+                }
+            }
+        }
+        return { mask: mBig, px: n, bb: bb, fill: fill };
+    }
+    function strongHue(data, W, H) {
+        var bins = new Array(36).fill(0), total = 0;
+        for (var i = 0; i < W * H; i++) {
+            var o = i * 4;
+            var r = data[o], g = data[o + 1], b = data[o + 2];
+            var mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+            if (mx < 60) continue;
+            if ((mx - mn) / mx < 0.30) continue;
+            var h = rgb2hue(r, g, b);
+            if (h < 0) continue;
+            bins[Math.floor(h / 10) % 36]++; total++;
+        }
+        if (total < 30) return -1;
+        var maxBin = 0, maxC = -1;
+        for (var j = 0; j < 36; j++) if (bins[j] > maxC) { maxC = bins[j]; maxBin = j; }
+        if (maxC / total < 0.30) return -1;
+        var sum = 0, wsum = 0;
+        for (var k = 0; k < 36; k++) {
+            var d = Math.min(Math.abs(k - maxBin), 36 - Math.abs(k - maxBin));
+            if (d <= 3) { sum += k * bins[k]; wsum += bins[k]; }
+        }
+        return wsum ? (sum / wsum) * 10 : maxBin * 10;
+    }
+
+    function buildShape(mask, W, bb) {
+        var sig = fitGrid(mask, W, bb.minX, bb.minY, bb.maxX, bb.maxY);
+        sig = alignByCOM(sig, CFG.GRID);
+        var blurred = CFG.BLUR_ENABLED ? blurGrid(sig, CFG.GRID) : sig;
+        return {
+            sig: sig, blurred: blurred,
+            aspect: gridAspect(sig, CFG.GRID),
+            radial: radialProfile(sig, CFG.GRID, CFG.RADIAL_BINS),
+            hu: huMoments(sig, CFG.GRID),
+            holes: countHoles(sig, CFG.GRID),
+            sol: solidity(sig, CFG.GRID)
+        };
+    }
+
+    var optCache = {};
+    function hashString(str) {
+        var h = 5381;
+        for (var i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+        return h.toString(36);
+    }
+
+    function targetSig(img) {
+        var W = Math.max(1, Math.round(img.naturalWidth / CFG.DOWNSCALE));
+        var H = Math.max(1, Math.round(img.naturalHeight / CFG.DOWNSCALE));
+        var minPx = Math.max(30, Math.round(W * H * 0.010));
+        var c = mk(W, H), cx = c.getContext('2d', { willReadFrequently: true });
+        cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+        cx.drawImage(img, 0, 0, W, H);
+        var data;
+        try { data = cx.getImageData(0, 0, W, H).data; }
+        catch (e) { err('getImageData failed', e); return null; }
+        var bg = modeBg(data, W, H);
+        var chroma = chromaMask(data, W, H, CFG.CHROMA_MIN);
+        var rC = cleanPipeline(chroma, W, H, minPx);
+        var bgd = bgDistMask(data, W, H, bg, CFG.BG_DIST_MIN);
+        var rB = cleanPipeline(bgd, W, H, minPx);
+        var winner = null, src = '';
+        if (rC && rB) {
+            var sc = rC.fill * Math.min(1, rC.px / minPx);
+            var sb = rB.fill * Math.min(1, rB.px / minPx);
+            if (sc >= sb) { winner = rC; src = 'chroma'; } else { winner = rB; src = 'bgdist'; }
+        } else if (rC) { winner = rC; src = 'chroma'; }
+        else if (rB) { winner = rB; src = 'bgdist'; }
+        if (!winner) {
+            var rCL = cleanPipeline(chromaMask(data, W, H, 8), W, H, Math.round(minPx * 0.7));
+            if (rCL) { winner = rCL; src = 'chroma-low'; }
+        }
+        if (!winner) {
+            var rBL = cleanPipeline(bgDistMask(data, W, H, bg, CFG.BG_DIST_MIN * 0.6), W, H, Math.round(minPx * 0.7));
+            if (rBL) { winner = rBL; src = 'bgdist-low'; }
+        }
+        if (!winner) return null;
+        var hue = strongHue(data, W, H);
+        var shape = buildShape(winner.mask, W, winner.bb);
+        shape.hue = hue;
+        shape.rawData = data; shape.rawW = W; shape.rawH = H;
+        shape.rawMask = winner.mask; shape.rawBb = winner.bb;
+        shape.src = src; shape.maskFill = winner.fill;
+        log('T ' + src + ' px=' + winner.px + ' fill=' + ((winner.fill * 100) | 0) + '% h=' + (hue < 0 ? 'n/a' : hue.toFixed(0))
+            + ' holes=' + shape.holes + ' sol=' + shape.sol.toFixed(2));
+        return shape;
+    }
+
+    function optionSig(svgEl) {
+        var outer = svgEl.outerHTML;
+        var key = hashString(outer);
+        if (CFG.CACHE_SIGS && optCache[key]) return Promise.resolve(optCache[key]);
+        return new Promise(function (res) {
+            var optHue = -1;
+            var paths = svgEl.querySelectorAll('path');
+            for (var i = 0; i < paths.length; i++) {
+                var rgb = parseFill(paths[i].getAttribute('fill'));
+                if (rgb) { var h = rgb2hue(rgb.r, rgb.g, rgb.b); if (h >= 0) { optHue = h; break; } }
+            }
+            if (optHue < 0) {
+                var gs = svgEl.querySelectorAll('g[fill]');
+                for (var j = 0; j < gs.length; j++) {
+                    var rgb2 = parseFill(gs[j].getAttribute('fill'));
+                    if (rgb2) { var h2 = rgb2hue(rgb2.r, rgb2.g, rgb2.b); if (h2 >= 0) { optHue = h2; break; } }
+                }
+            }
+            var clone = svgEl.cloneNode(true);
+            clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+            var S = 256;
+            clone.setAttribute('width', S); clone.setAttribute('height', S);
+            var p2 = clone.querySelectorAll('path');
+            for (var k = 0; k < p2.length; k++) p2[k].setAttribute('fill', '#fff');
+            var xml = new XMLSerializer().serializeToString(clone);
+            var url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(xml);
+            var img = new Image();
+            img.onload = function () {
+                try {
+                    var c = mk(S, S), cx = c.getContext('2d', { willReadFrequently: true });
+                    cx.drawImage(img, 0, 0, S, S);
+                    var dd = cx.getImageData(0, 0, S, S).data;
+                    var a = new Uint8Array(S * S);
+                    for (var m = 0; m < S * S; m++) if (dd[m * 4 + 3] > 40) a[m] = 1;
+                    var bb = bbox(a, S, S);
+                    if (!bb.ok) { res(null); return; }
+                    var shape = buildShape(a, S, bb);
+                    shape.hue = optHue;
+                    if (CFG.CACHE_SIGS) optCache[key] = shape;
+                    res(shape);
+                } catch (e) { res(null); }
+            };
+            img.onerror = function () { res(null); };
+            img.src = url;
+        });
+    }
+
+    function precomputeRotations(tShape, step) {
+        var out = [];
+        for (var ang = 0; ang < 360; ang += step) {
+            var rotSig = ang === 0 ? tShape.sig : rotateGrid(tShape.sig, ang);
+            var rotBlur = CFG.BLUR_ENABLED ? blurGrid(rotSig, CFG.GRID) : rotSig;
+            var rotRad = radialProfile(rotSig, CFG.GRID, CFG.RADIAL_BINS);
+            out.push({ angle: ang, sig: rotSig, blurred: rotBlur, radial: rotRad });
+        }
+        return out;
+    }
+    function variantsAround(tShape, angle, range, step) {
+        var v = [];
+        for (var off = -range; off <= range; off += step) {
+            var a = ((angle + off) % 360 + 360) % 360;
+            var rotSig = a === 0 ? tShape.sig : rotateGrid(tShape.sig, a);
+            var rotBlur = CFG.BLUR_ENABLED ? blurGrid(rotSig, CFG.GRID) : rotSig;
+            var rotRad = radialProfile(rotSig, CFG.GRID, CFG.RADIAL_BINS);
+            v.push({ angle: a, sig: rotSig, blurred: rotBlur, radial: rotRad });
+        }
+        return v;
+    }
+    function evalOverlapRadial(variants, optShape) {
+        var best = { score: -1, angle: 0, overlap: 0, radial: 0 };
+        for (var i = 0; i < variants.length; i++) {
+            var v = variants[i];
+            var so = CFG.BLUR_ENABLED ? softOverlap(v.blurred, optShape.blurred) : 0;
+            var m = scoreMasks(v.sig, optShape.sig);
+            var hard = 0.4 * m.iou + 0.6 * m.cov;
+            var overlap = CFG.BLUR_ENABLED ? (0.5 * so + 0.5 * hard) : hard;
+            var rad = radialSim(v.radial, optShape.radial);
+            var s = CFG.WEIGHT_OVERLAP * overlap + CFG.WEIGHT_RADIAL * rad;
+            if (s > best.score) { best.score = s; best.angle = v.angle; best.overlap = overlap; best.radial = rad; }
+        }
+        return best;
+    }
+    function finalScore(tShape, optShape, coarse) {
+        var hu = huSimilarity(tShape.hu, optShape.hu);
+        var hole = holeMatch(tShape.holes, optShape.holes);
+        var sol = soliditySim(tShape.sol, optShape.sol);
+        var asp = Math.max(0, 1 - Math.abs(tShape.aspect - optShape.aspect));
+        var hue = hueMatch(tShape.hue, optShape.hue);
+        var total =
+              CFG.WEIGHT_OVERLAP  * coarse.overlap
+            + CFG.WEIGHT_RADIAL   * coarse.radial
+            + CFG.WEIGHT_HU       * hu
+            + CFG.WEIGHT_HOLE     * hole
+            + CFG.WEIGHT_SOLIDITY * sol
+            + CFG.WEIGHT_ASPECT   * asp
+            + CFG.WEIGHT_COLOR    * hue;
+        return { total: total, hu: hu, hole: hole, sol: sol, asp: asp, hue: hue, overlap: coarse.overlap, radial: coarse.radial };
+    }
+
+    function fireClick(el) {
+        var r = el.getBoundingClientRect();
+        var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        var base = { bubbles: true, cancelable: true, view: window, button: 0, buttons: 1, clientX: cx, clientY: cy };
+        function fire(t, C, ex) {
+            try {
+                var o = {}; for (var k in base) o[k] = base[k];
+                if (ex) for (var k2 in ex) o[k2] = ex[k2];
+                el.dispatchEvent(new C(t, o));
+            } catch (e) {}
+        }
+        if (typeof PointerEvent !== 'undefined') {
+            fire('pointerover', PointerEvent, { pointerType: 'mouse', pointerId: 1, isPrimary: true });
+            fire('pointerenter', PointerEvent, { pointerType: 'mouse', pointerId: 1, isPrimary: true, bubbles: false });
+            fire('pointerdown', PointerEvent, { pointerType: 'mouse', pointerId: 1, isPrimary: true });
+        }
+        fire('mouseover', MouseEvent);
+        fire('mouseenter', MouseEvent, { bubbles: false });
+        fire('mousedown', MouseEvent);
+        if (typeof PointerEvent !== 'undefined') fire('pointerup', PointerEvent, { pointerType: 'mouse', pointerId: 1, isPrimary: true });
+        fire('mouseup', MouseEvent);
+        fire('click', MouseEvent);
+        try { el.click(); } catch (e) {}
+        return { cx: cx, cy: cy };
+    }
+
+    function getDialog() { return document.querySelector('section[role="dialog"][aria-labelledby="icon-captcha-title"]'); }
+    function getTargetImg(root) { return root.querySelector('[class*="imageFrame"] img') || root.querySelector('img'); }
+    function getOptions(root) { return [].slice.call(root.querySelectorAll('button[aria-label^="Option"]')); }
+    function getRefresh(root) {
+        var found = null;
+        try {
+            found = root.querySelector('button[class*="refresh"]') || root.querySelector('button[class*="Refresh"]');
+            if (!found) { var footer = root.querySelector('footer'); if (footer) found = footer.querySelector('button'); }
+            if (!found) {
+                var bs = root.querySelectorAll('button');
+                for (var i = 0; i < bs.length; i++) if (/refresh|reload|new/i.test(bs[i].textContent || '')) { found = bs[i]; break; }
+            }
+        } catch (e) {}
+        return found;
+    }
+    function getMessage(root) { try { return root.querySelector('[class*="message"]'); } catch (e) { return null; } }
+
+    // ---- verify button (Xác minh để tiếp tục) ----
+    function getVerifyButton() {
+        try {
+            var b = document.querySelector('button[class*="captchaButton"]');
+            if (b) return b;
+            var bs = document.querySelectorAll('button');
+            for (var i = 0; i < bs.length; i++) {
+                if (CFG.VERIFY_TEXT.test(bs[i].textContent || '')) return bs[i];
+            }
+        } catch (e) {}
+        return null;
+    }
+    var lastVerifyClick = 0;
+    function checkVerifyButton() {
+        try {
+            if (!CFG.VERIFY_BUTTON_ENABLED) return false;
+            if (Date.now() - SCRIPT_LOAD_TIME < CFG.VERIFY_INITIAL_DELAY_MS) return false;
+            if (Date.now() - lastVerifyClick < CFG.VERIFY_COOLDOWN_MS) return false;
+            if (getDialog()) return false;
+            var btn = getVerifyButton();
+            if (!btn) return false;
+            var r = btn.getBoundingClientRect();
+            if (r.width < 10 || r.height < 10) return false;
+            if (btn.disabled) return false;
+            lastVerifyClick = Date.now();
+            log('clicking verify button "Xác minh để tiếp tục"');
+            fireClick(btn);
+            return true;
+        } catch (e) {}
+        return false;
+    }
+
+    // ---- continue button (sau khi captcha pass) ----
+    var lastContinueClick = 0;
+    function getContinueButton() {
+        try {
+            var b = document.querySelector('button[class*="IconCaptcha_continue"]');
+            if (b) return b;
+            b = document.querySelector('button[class*="continue__"]');
+            if (b) return b;
+            // fallback by text
+            var root = getDialog();
+            if (root) {
+                var bs = root.querySelectorAll('button');
+                for (var i = 0; i < bs.length; i++) {
+                    var t = (bs[i].textContent || '').trim();
+                    if (/^continue$/i.test(t) || /^tiếp tục$/i.test(t)) return bs[i];
+                }
+            }
+        } catch (e) {}
+        return null;
+    }
+    function checkContinueButton() {
+        try {
+            if (!CFG.CONTINUE_BUTTON_ENABLED) return false;
+            if (Date.now() - lastContinueClick < CFG.CONTINUE_COOLDOWN_MS) return false;
+            var root = getDialog();
+            if (!root) return false;
+            // success check
+            if (CFG.CONTINUE_REQUIRE_SUCCESS_MSG) {
+                var msg = getMessage(root);
+                var msgText = msg ? (msg.textContent || '') : '';
+                if (!CFG.SUCCESS_MSG.test(msgText)) return false;
+            }
+            var btn = getContinueButton();
+            if (!btn) return false;
+            var r = btn.getBoundingClientRect();
+            if (r.width < 10 || r.height < 10) return false;
+            if (btn.disabled) return false;
+            lastContinueClick = Date.now();
+            log('clicking Continue button (captcha passed)');
+            fireClick(btn);
+            // reset state for next captcha
+            clickLock = false;
+            lastSrc = null;
+            globalRefreshCount = 0;
+            return true;
+        } catch (e) {}
+        return false;
+    }
+
+    var lastPageReload = 0;
+    function performReturn(reason) {
+        var mode = CFG.RETURN_MODE || 'back';
+        var url = (CFG.RETURN_URL || '').trim();
+        log('return — mode=' + mode + ' reason=' + reason);
+        setTimeout(function () {
+            if (mode === 'url' && url) { try { location.href = url; return; } catch (e) {} }
+            if (mode === 'back') {
+                try { if (history.length > 1) { history.back(); return; } } catch (e) {}
+                if (url) { try { location.href = url; return; } catch (e) {} }
+                location.reload(); return;
+            }
+            location.reload();
+        }, CFG.PAGE_RELOAD_DELAY);
+    }
+    function checkPageReturn() {
+        try {
+            if (Date.now() - lastPageReload <= CFG.PAGE_RELOAD_COOLDOWN) return false;
+            var needReturn = false;
+            var dlg = document.querySelector('section[role="dialog"][aria-labelledby="icon-captcha-title"]');
+            if (dlg) {
+                var m = dlg.querySelector('[class*="message"]');
+                if (m && CFG.PAGE_RELOAD_MSG.test(m.textContent || '')) needReturn = true;
+            }
+            if (!needReturn && document.body) {
+                if (CFG.PAGE_RELOAD_MSG.test(document.body.innerText || '')) needReturn = true;
+            }
+            if (needReturn) { lastPageReload = Date.now(); performReturn('refresh-message'); return true; }
+        } catch (e) {}
+        return false;
+    }
+
+    var lastSrc = null, clickLock = false, lockTime = 0;
+    var pendingAction = null, pendingSrc = null;
+    var lastMaskFailSrc = null;
+    var globalRefreshCount = 0, globalCooldownUntil = 0;
+    var solving = false;
+
+    function solve() {
+        if (solving) return;
+        try {
+            if (checkPageReturn()) return;
+            var root = getDialog();
+            if (!root) {
+                var p = document.getElementById('dbg-panel'); if (p) p.remove();
+                pendingAction = null; globalRefreshCount = 0;
+                checkVerifyButton();
+                return;
+            }
+
+            // captcha đã pass, có nút Continue → click luôn
+            if (checkContinueButton()) return;
+
+            var img = getTargetImg(root);
+            if (!img) return;
+            if (Date.now() < globalCooldownUntil) return;
+
+            if (pendingAction) {
+                if (img.src !== pendingSrc) { pendingAction = null; }
+                else if (Date.now() >= pendingAction.deadline) {
+                    var act = pendingAction; pendingAction = null;
+                    if (act.type === 'click') {
+                        var info = fireClick(act.el);
+                        clickLock = true; lockTime = Date.now(); lastSrc = img.src;
+                        log('CLICKED O' + (act.idx + 1) + ' @ ' + Math.round(info.cx) + ',' + Math.round(info.cy));
+                    } else if (act.type === 'refresh') {
+                        try { act.el.click(); } catch (e) {}
+                        clickLock = true; lockTime = Date.now(); lastSrc = img.src;
+                        log('REFRESHED');
+                    }
+                }
+                return;
+            }
+
+            if (!img.complete || !img.naturalWidth) return;
+            if (img.src !== lastSrc) { clickLock = false; lastSrc = img.src; }
+            if (clickLock && Date.now() - lockTime > 5000) { clickLock = false; }
+            if (clickLock) return;
+
+            var msg = getMessage(root);
+            if (msg && /wrong|incorrect|try again|sai|không đúng/i.test(msg.textContent || '')) {
+                var rf0 = getRefresh(root);
+                if (rf0) { rf0.click(); clickLock = true; lockTime = Date.now(); lastSrc = img.src; }
+                return;
+            }
+
+            // bắt đầu công việc nặng
+            solving = true;
+            function done() { solving = false; }
+
+            var t = targetSig(img);
+            if (!t) {
+                if (lastMaskFailSrc !== img.src) {
+                    lastMaskFailSrc = img.src;
+                    var rf1 = getRefresh(root);
+                    if (rf1) { rf1.click(); clickLock = true; lockTime = Date.now(); lastSrc = img.src; }
+                }
+                done(); return;
+            }
+
+            var btns = getOptions(root);
+            if (btns.length < 2) { done(); return; }
+            var optResults = new Array(btns.length).fill(null);
+            var jobs = btns.map(function (btn, idx) {
+                var svg = btn.querySelector('svg');
+                if (!svg) return Promise.resolve();
+                return optionSig(svg).then(function (r) { optResults[idx] = r; });
+            });
+
+            Promise.all(jobs).then(function () {
+                try {
+                    var cms = [];
+                    for (var ii = 0; ii < optResults.length; ii++) cms.push(optResults[ii] ? hueMatch(t.hue, optResults[ii].hue) : 0);
+                    var strongIdx = [];
+                    for (var kk = 0; kk < cms.length; kk++) if (cms[kk] >= CFG.HUE_STRONG) strongIdx.push(kk);
+
+                    var coarseRot = precomputeRotations(t, CFG.ANGLE_STEP);
+
+                    var best = { score: -1, idx: -1, angle: 0, cm: 0, shape: 0 };
+                    var second = { score: -1, idx: -1, angle: 0, cm: 0, shape: 0 };
+                    var perOverlap = [], perHu = [], perHole = [], perCombined = [];
+
+                    for (var i = 0; i < optResults.length; i++) {
+                        if (!optResults[i]) { perOverlap.push('--'); perHu.push('--'); perHole.push('--'); perCombined.push('--'); continue; }
+                        var opt = optResults[i];
+                        var c1 = evalOverlapRadial(coarseRot, opt);
+                        var fineVars = variantsAround(t, c1.angle, CFG.FINE_RANGE, CFG.FINE_STEP);
+                        var c2 = evalOverlapRadial(fineVars, opt);
+                        var angleChosen = c2.score >= c1.score ? c2.angle : c1.angle;
+                        var coarse = c2.score >= c1.score ? c2 : c1;
+                        if (CFG.MICRO_ENABLED) {
+                            var microVars = variantsAround(t, angleChosen, CFG.MICRO_RANGE, CFG.MICRO_STEP);
+                            var c3 = evalOverlapRadial(microVars, opt);
+                            if (c3.score > coarse.score) { coarse = c3; angleChosen = c3.angle; }
+                        }
+                        var fin = finalScore(t, opt, coarse);
+                        var comb = fin.total;
+                        if (strongIdx.length === 1 && strongIdx[0] === i) comb += CFG.HUE_BOOST;
+                        else if (strongIdx.length > 1 && strongIdx.indexOf(i) >= 0) comb += CFG.HUE_BOOST * 0.3;
+
+                        perOverlap.push(fin.overlap.toFixed(3));
+                        perHu.push(fin.hu.toFixed(3));
+                        perHole.push(fin.hole.toFixed(2));
+                        perCombined.push(comb.toFixed(3));
+
+                        if (comb > best.score) {
+                            second = { score: best.score, idx: best.idx, angle: best.angle, cm: best.cm, shape: best.shape };
+                            best = { score: comb, idx: i, angle: angleChosen, cm: fin.hue, shape: fin.overlap };
+                        } else if (comb > second.score && i !== best.idx) {
+                            second = { score: comb, idx: i, angle: angleChosen, cm: fin.hue, shape: fin.overlap };
+                        }
+                    }
+                    var margin = best.score - second.score;
+                    log('overlap: ' + perOverlap.join(' '));
+                    log('hu:      ' + perHu.join(' '));
+                    log('hole:    ' + perHole.join(' '));
+                    log('comb:    ' + perCombined.join(' '));
+                    log('strongHue: [' + strongIdx.map(function (x) { return 'O' + (x + 1); }).join(',') + ']');
+                    log('BEST O' + (best.idx + 1) + ' @ ' + best.angle + '° = ' + best.score.toFixed(3)
+                        + ' | 2nd O' + (second.idx + 1) + ' = ' + second.score.toFixed(3) + ' margin=' + margin.toFixed(3));
+
+                    var decision = 'refresh', reason = '';
+                    if (best.idx < 0) reason = 'no best';
+                    else if (best.score < CFG.MIN_SCORE) reason = 'score<min';
+                    else if (margin < CFG.MIN_MARGIN) reason = 'margin<min';
+                    else { decision = 'click'; reason = 'ok'; }
+                    log('DECISION:', decision, '(' + reason + ')');
+
+                    if (decision === 'click') {
+                        pendingAction = { type: 'click', el: btns[best.idx], idx: best.idx, deadline: Date.now() + CFG.ACTION_DELAY_MS };
+                        pendingSrc = img.src;
+                        globalRefreshCount = 0;
+                    } else {
+                        globalRefreshCount++;
+                        if (globalRefreshCount >= CFG.GLOBAL_REFRESH_LIMIT) {
+                            warn('hit cap — cooldown');
+                            globalCooldownUntil = Date.now() + CFG.GLOBAL_COOLDOWN_MS;
+                            globalRefreshCount = 0;
+                            if (best.idx >= 0) {
+                                log('best-effort click O' + (best.idx + 1));
+                                fireClick(btns[best.idx]);
+                                clickLock = true; lockTime = Date.now(); lastSrc = img.src;
+                            }
+                        } else {
+                            var rf = getRefresh(root);
+                            if (rf) { rf.click(); clickLock = true; lockTime = Date.now(); lastSrc = img.src; }
+                        }
+                    }
+                } catch (e) { err('inner then:', e, e && e.stack); }
+                finally { done(); }
+            }).catch(function (e) { err('Promise.all:', e); done(); });
+        } catch (e) {
+            err('solve:', e, e && e.stack);
+            solving = false;
+        }
+    }
+
+    // ===================== GUI =====================
+    var GUI_ID = 'solver-gui-root';
+    var solveInterval = null;
+
+    var GUI_CSS = [
+        '#' + GUI_ID + '-btn{position:fixed;top:12px;right:12px;z-index:2147483646;width:36px;height:36px;border-radius:50%;background:#1e293b;color:#22d3ee;border:2px solid #22d3ee;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(0,0,0,.5);font-family:monospace;user-select:none}',
+        '#' + GUI_ID + '-btn:hover{background:#334155}',
+        '#' + GUI_ID + '{position:fixed;top:56px;right:12px;z-index:2147483647;width:360px;background:#0f172a;color:#e2e8f0;border:2px solid #22d3ee;border-radius:10px;font-family:monospace;font-size:12px;box-shadow:0 12px 40px rgba(0,0,0,.7);display:none;overflow:hidden}',
+        '#' + GUI_ID + '.open{display:block}',
+        '#' + GUI_ID + ' .hdr{background:#1e293b;padding:8px 12px;font-weight:bold;color:#22d3ee;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #334155}',
+        '#' + GUI_ID + ' .hdr .close{cursor:pointer;color:#f87171;font-size:14px;padding:2px 6px}',
+        '#' + GUI_ID + ' .body{padding:10px 12px;max-height:72vh;overflow-y:auto}',
+        '#' + GUI_ID + ' .row{display:flex;align-items:center;margin:6px 0;gap:8px}',
+        '#' + GUI_ID + ' .row label{flex:1;color:#94a3b8}',
+        '#' + GUI_ID + ' .row input, #' + GUI_ID + ' .row select{flex:1;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-family:monospace;font-size:12px}',
+        '#' + GUI_ID + ' .row input:focus, #' + GUI_ID + ' .row select:focus{outline:none;border-color:#22d3ee}',
+        '#' + GUI_ID + ' .sect{color:#22d3ee;font-weight:bold;margin:12px 0 4px;border-bottom:1px dashed #334155;padding-bottom:3px}',
+        '#' + GUI_ID + ' .btns{display:flex;gap:8px;margin-top:12px}',
+        '#' + GUI_ID + ' .btns button{flex:1;padding:6px;border-radius:5px;border:none;cursor:pointer;font-family:monospace;font-weight:bold;font-size:12px}',
+        '#' + GUI_ID + ' .save{background:#22d3ee;color:#0f172a}',
+        '#' + GUI_ID + ' .save:hover{background:#67e8f9}',
+        '#' + GUI_ID + ' .reset{background:#475569;color:#e2e8f0}',
+        '#' + GUI_ID + ' .reset:hover{background:#64748b}',
+        '#' + GUI_ID + ' .hint{color:#64748b;font-size:11px;margin-top:4px}',
+        '#' + GUI_ID + ' .status{margin-top:8px;color:#4ade80;font-size:11px;text-align:center;height:14px}'
+    ].join('\n');
+    try { GM_addStyle(GUI_CSS); }
+    catch (e) { var st = document.createElement('style'); st.textContent = GUI_CSS; document.head.appendChild(st); }
+
+    var FIELDS = [
+        { sect: 'Timing' },
+        { k: 'ACTION_DELAY_MS', label: 'Action delay (ms)', type: 'number' },
+        { k: 'SCAN_MS', label: 'Scan interval (ms)', type: 'number' },
+        { sect: 'Decision' },
+        { k: 'MIN_SCORE', label: 'MIN_SCORE', type: 'number', step: '0.01' },
+        { k: 'MIN_MARGIN', label: 'MIN_MARGIN', type: 'number', step: '0.01' },
+        { k: 'HUE_STRONG', label: 'Hue strong', type: 'number', step: '0.01' },
+        { k: 'HUE_BOOST', label: 'Hue boost', type: 'number', step: '0.01' },
+        { k: 'HUE_TOLERANCE', label: 'Hue tol (deg)', type: 'number' },
+        { k: 'HU_DIST_SCALE', label: 'Hu scale', type: 'number', step: '0.1' },
+        { sect: 'Weights' },
+        { k: 'WEIGHT_OVERLAP', label: 'W: overlap', type: 'number', step: '0.01' },
+        { k: 'WEIGHT_RADIAL', label: 'W: radial', type: 'number', step: '0.01' },
+        { k: 'WEIGHT_HU', label: 'W: hu', type: 'number', step: '0.01' },
+        { k: 'WEIGHT_HOLE', label: 'W: holes', type: 'number', step: '0.01' },
+        { k: 'WEIGHT_SOLIDITY', label: 'W: solidity', type: 'number', step: '0.01' },
+        { k: 'WEIGHT_ASPECT', label: 'W: aspect', type: 'number', step: '0.01' },
+        { k: 'WEIGHT_COLOR', label: 'W: color', type: 'number', step: '0.01' },
+        { sect: 'Resolution & Search' },
+        { k: 'GRID', label: 'Grid size', type: 'number' },
+        { k: 'DOWNSCALE', label: 'Downscale', type: 'number' },
+        { k: 'RADIAL_BINS', label: 'Radial bins', type: 'number' },
+        { k: 'ANGLE_STEP', label: 'Coarse step', type: 'number' },
+        { k: 'FINE_STEP', label: 'Fine step', type: 'number' },
+        { k: 'FINE_RANGE', label: 'Fine range ±', type: 'number' },
+        { k: 'MICRO_ENABLED', label: 'Micro stage', type: 'checkbox' },
+        { k: 'MICRO_STEP', label: 'Micro step', type: 'number' },
+        { k: 'MICRO_RANGE', label: 'Micro range ±', type: 'number' },
+        { sect: 'Mask' },
+        { k: 'BLUR_ENABLED', label: 'Blur masks', type: 'checkbox' },
+        { k: 'CACHE_SIGS', label: 'Cache sigs', type: 'checkbox' },
+        { k: 'BLOB_TRIM_THR', label: 'Blob trim', type: 'number', step: '0.01' },
+        { k: 'HOLE_MIN_SIZE', label: 'Hole min (px)', type: 'number' },
+        { k: 'CHROMA_MIN', label: 'Chroma min', type: 'number' },
+        { k: 'BG_DIST_MIN', label: 'BG dist min', type: 'number' },
+        { sect: 'Verify Button' },
+        { k: 'VERIFY_BUTTON_ENABLED', label: 'Auto-click verify', type: 'checkbox' },
+        { k: 'VERIFY_INITIAL_DELAY_MS', label: 'Verify initial delay', type: 'number' },
+        { k: 'VERIFY_COOLDOWN_MS', label: 'Verify cooldown', type: 'number' },
+        { sect: 'Continue Button' },
+        { k: 'CONTINUE_BUTTON_ENABLED', label: 'Auto-click continue', type: 'checkbox' },
+        { k: 'CONTINUE_COOLDOWN_MS', label: 'Continue cooldown', type: 'number' },
+        { k: 'CONTINUE_REQUIRE_SUCCESS_MSG', label: 'Require success msg', type: 'checkbox' },
+        { sect: 'Refresh' },
+        { k: 'GLOBAL_REFRESH_LIMIT', label: 'Refresh cap', type: 'number' },
+        { k: 'GLOBAL_COOLDOWN_MS', label: 'Cooldown (ms)', type: 'number' },
+        { sect: 'Page Return' },
+        { k: 'RETURN_MODE', label: 'Mode', type: 'select', opts: ['back', 'url', 'reload'] },
+        { k: 'RETURN_URL', label: 'Return URL', type: 'text' },
+        { k: 'PAGE_RELOAD_DELAY', label: 'Delay (ms)', type: 'number' },
+        { k: 'PAGE_RELOAD_COOLDOWN', label: 'Cooldown (ms)', type: 'number' },
+        { sect: 'Debug' },
+        { k: 'SHOW_DEBUG', label: 'Visual panel', type: 'checkbox' },
+        { k: 'VERBOSE', label: 'Verbose logs', type: 'checkbox' }
+    ];
+
+    function buildGUI() {
+        var btn = document.createElement('div');
+        btn.id = GUI_ID + '-btn';
+        btn.textContent = '\u2699';
+        btn.title = 'Solver config';
+        document.body.appendChild(btn);
+
+        var root = document.createElement('div');
+        root.id = GUI_ID;
+        var html = '<div class="hdr"><span>IconCaptcha Solver v' + SCRIPT_VERSION + '</span><span class="close">\u2715</span></div><div class="body">';
+        for (var i = 0; i < FIELDS.length; i++) {
+            var f = FIELDS[i];
+            if (f.sect) { html += '<div class="sect">' + f.sect + '</div>'; continue; }
+            html += '<div class="row"><label>' + f.label + '</label>';
+            if (f.type === 'checkbox') html += '<input type="checkbox" data-k="' + f.k + '"' + (CFG[f.k] ? ' checked' : '') + '>';
+            else if (f.type === 'select') {
+                html += '<select data-k="' + f.k + '">';
+                for (var oi = 0; oi < f.opts.length; oi++) html += '<option value="' + f.opts[oi] + '"' + (CFG[f.k] === f.opts[oi] ? ' selected' : '') + '>' + f.opts[oi] + '</option>';
+                html += '</select>';
+            } else {
+                html += '<input type="' + f.type + '" data-k="' + f.k + '" value="' + (CFG[f.k] === undefined ? '' : CFG[f.k]) + '"' + (f.step ? ' step="' + f.step + '"' : '') + '>';
+            }
+            html += '</div>';
+        }
+        html += '<div class="btns"><button class="save">Save</button><button class="reset">Reset</button></div>';
+        html += '<div class="status" id="' + GUI_ID + '-status"></div>';
+        html += '<div class="hint">Apply immediately. Scan interval reloads live.</div>';
+        html += '</div>';
+        root.innerHTML = html;
+        document.body.appendChild(root);
+
+        btn.addEventListener('click', function () {
+            root.classList.toggle('open');
+            if (root.classList.contains('open')) refreshInputs();
+        });
+        root.querySelector('.close').addEventListener('click', function () { root.classList.remove('open'); });
+
+        function refreshInputs() {
+            var inputs = root.querySelectorAll('[data-k]');
+            for (var i = 0; i < inputs.length; i++) {
+                var el = inputs[i];
+                var kk = el.getAttribute('data-k');
+                if (el.type === 'checkbox') el.checked = !!CFG[kk];
+                else el.value = CFG[kk] === undefined ? '' : CFG[kk];
+            }
+        }
+        function setStatus(txt, color) {
+            var s = document.getElementById(GUI_ID + '-status');
+            if (!s) return;
+            s.textContent = txt || '';
+            s.style.color = color || '#4ade80';
+            if (txt) setTimeout(function () { if (s.textContent === txt) s.textContent = ''; }, 2000);
+        }
+
+        root.querySelector('.save').addEventListener('click', function () {
+            var inputs = root.querySelectorAll('[data-k]');
+            for (var i = 0; i < inputs.length; i++) {
+                var el = inputs[i];
+                var kk = el.getAttribute('data-k');
+                var v;
+                if (el.type === 'checkbox') v = el.checked;
+                else if (el.type === 'number') { var n = parseFloat(el.value); v = isNaN(n) ? DEFAULTS[kk] : n; }
+                else v = el.value;
+                CFG[kk] = v;
+            }
+            saveConfig();
+            optCache = {};
+            if (solveInterval) clearInterval(solveInterval);
+            solveInterval = setInterval(solve, CFG.SCAN_MS);
+            setStatus('saved · scan=' + CFG.SCAN_MS + 'ms', '#4ade80');
+        });
+        root.querySelector('.reset').addEventListener('click', function () {
+            if (!confirm('Reset all settings to default?')) return;
+            resetConfig();
+            optCache = {};
+            refreshInputs();
+            if (solveInterval) clearInterval(solveInterval);
+            solveInterval = setInterval(solve, CFG.SCAN_MS);
+            setStatus('reset', '#fbbf24');
+        });
+    }
+
+    try { GM_registerMenuCommand('Open Solver Config', function () {
+        var r = document.getElementById(GUI_ID);
+        if (r) r.classList.toggle('open');
+        else { buildGUI(); document.getElementById(GUI_ID).classList.add('open'); }
+    }); } catch (e) {}
+
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', buildGUI);
+    else buildGUI();
+
+    log('v' + SCRIPT_VERSION + ' loaded — GRID=' + CFG.GRID + ' scan=' + CFG.SCAN_MS + 'ms delay=' + CFG.ACTION_DELAY_MS + 'ms');
+    solveInterval = setInterval(solve, CFG.SCAN_MS);
+})();
